@@ -1,0 +1,6 @@
+{
+  "name": "KKTC Belediye Başkanları Puanlama",
+  "description": "KKTC'deki mevcut belediye başkanlarını belirli kriterlere göre değerlendirip puanlayabileceğiniz ve güncel haberlerini görebileceğiniz bir platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
