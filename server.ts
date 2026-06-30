@@ -1,14 +1,15 @@
 import express from "express";
 import path from "path";
 import { GoogleGenAI } from "@google/genai";
-import { initializeApp as initializeAdminApp, cert } from 'firebase-admin/app';
+import { initializeApp as initializeAdminApp, cert, getApps as getAdminApps } from 'firebase-admin/app';
 import { getFirestore as getAdminFirestore, FieldValue } from 'firebase-admin/firestore';
 import { initializeApp as initializeClientApp } from 'firebase/app';
 import { getFirestore as getClientFirestore, collection, getDocs, doc, getDoc, setDoc } from 'firebase/firestore';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.use(express.json());
 
@@ -36,11 +37,32 @@ try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
     // Vercel deployment approach
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
-    const firebaseApp = initializeAdminApp({
-      credential: cert(serviceAccount)
-    });
-    adminDb = getAdminFirestore(firebaseApp);
-    console.log("Firebase initialized successfully from Service Account (Vercel)");
+    const existingApps = getAdminApps();
+    const firebaseApp = existingApps.length > 0 
+      ? existingApps[0] 
+      : initializeAdminApp({
+          credential: cert(serviceAccount)
+        });
+    
+    // Resolve custom Firestore database ID if available
+    let databaseId = "(default)";
+    const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
+    if (fs.existsSync(configPath)) {
+      try {
+        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        if (config.firestoreDatabaseId) {
+          databaseId = config.firestoreDatabaseId;
+        }
+      } catch (err) {
+        console.warn("Could not parse database ID from config:", err);
+      }
+    }
+    if (process.env.FIREBASE_DATABASE_ID) {
+      databaseId = process.env.FIREBASE_DATABASE_ID;
+    }
+    
+    adminDb = getAdminFirestore(firebaseApp, databaseId);
+    console.log(`Firebase initialized successfully from Service Account (Vercel) on database: ${databaseId}`);
   } else {
     // AI Studio local development approach
     const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
@@ -404,7 +426,13 @@ async function startServer() {
   });
 }
 
-if (!process.env.VERCEL) {
+// Check if the current file is being run directly (e.g. via tsx server.ts or node dist/server.cjs)
+const isMain = process.argv[1] && (
+  (typeof __filename !== 'undefined' && path.resolve(process.argv[1]) === path.resolve(__filename)) ||
+  (typeof import.meta !== 'undefined' && import.meta && import.meta.url && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url))
+);
+
+if (!process.env.VERCEL || isMain) {
   startServer();
 }
 

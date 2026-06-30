@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+.vercel/
+*-firebase-adminsdk-*.json
+belediye-ad281-firebase-adminsdk-fbsvc-4acc0dd474.json
