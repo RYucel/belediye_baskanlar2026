@@ -1,2 +1,5 @@
 import app from '../server';
-export default app;
+
+export default function(req: any, res: any) {
+  return app(req, res);
+}

@@ -383,7 +383,9 @@ app.post("/api/mayor/news", async (req, res) => {
 
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
-    const { createServer: createViteServer } = await import("vite");
+    // Hide vite import from bundlers
+    const viteMod = "vi" + "te";
+    const { createServer: createViteServer } = await import(viteMod);
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
