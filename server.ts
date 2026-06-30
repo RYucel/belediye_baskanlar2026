@@ -7,6 +7,7 @@ import { getFirestore as getClientFirestore, collection, getDocs, doc, getDoc, s
 import fs from 'fs';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { getOtpSender } from './mailer.js';
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -288,21 +289,104 @@ app.get("/api/mayors", async (req, res) => {
   }
 });
 
-const SERVER_PEPPER = process.env.SERVER_PEPPER || "kktc-belediye-voting-pepper-2026-secure-secret-key";
+// The pepper is REQUIRED. No hardcoded fallback: a default committed to a
+// public repo would make every credential hash computable (and therefore
+// enumerable) by anyone. If it is missing we refuse secure operations rather
+// than silently degrade integrity.
+const SERVER_PEPPER = process.env.SERVER_PEPPER || "";
+if (!SERVER_PEPPER) {
+  console.error("FATAL: SERVER_PEPPER is not set. Secure voting endpoints will be disabled.");
+}
 
+// OTP / abuse-control tuning.
+const OTP_TTL_MS = 10 * 60 * 1000;        // code valid for 10 minutes
+const OTP_RESEND_COOLDOWN_MS = 60 * 1000; // min gap between sends to one contact
+const OTP_MAX_SENDS_PER_WINDOW = 5;       // max sends per contact per window
+const OTP_SEND_WINDOW_MS = 60 * 60 * 1000;// rolling 1h window for the send cap
+const OTP_MAX_VERIFY_ATTEMPTS = 5;        // wrong-guess attempts before lockout
+
+function isEmail(contact: string): boolean {
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contact);
+}
+
+// Canonicalize a contact so trivial variations of the SAME identity collapse to
+// ONE credential. Without this, user+1@gmail.com / u.s.e.r@gmail.com / phone
+// format variants would each yield a distinct credential and allow re-voting.
 function normalizeContact(contact: string): string {
   const clean = contact.trim().toLowerCase();
+
   if (clean.includes('@')) {
-    return clean;
+    const [localRaw, domainRaw] = clean.split('@');
+    let local = localRaw;
+    const domain = domainRaw;
+    // Strip plus-addressing tags for all providers (user+anything -> user).
+    local = local.split('+')[0];
+    // Gmail ignores dots in the local part and treats googlemail as gmail.
+    if (domain === 'gmail.com' || domain === 'googlemail.com') {
+      local = local.replace(/\./g, '');
+      return `${local}@gmail.com`;
+    }
+    return `${local}@${domain}`;
   }
-  return clean.replace(/\D/g, '');
+
+  // Phone: keep digits only, then normalize to a country-code form so a leading
+  // 0 vs +90 (KKTC/TR) variant maps to the same identity.
+  let digits = clean.replace(/\D/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (digits.startsWith('0')) digits = '90' + digits.slice(1);
+  return digits;
 }
 
 function hashCredential(normalizedContact: string): string {
   return crypto.createHash('sha256').update(normalizedContact + SERVER_PEPPER).digest('hex');
 }
 
+function hashCode(code: string, credentialId: string): string {
+  // Bind the code hash to the credential so a stolen hash can't be replayed for
+  // a different contact, and so the plaintext code is never stored.
+  return crypto.createHash('sha256').update(code + credentialId + SERVER_PEPPER).digest('hex');
+}
+
+// --- Firestore single-doc helpers that abstract Client SDK vs Admin SDK ---
+async function dbGetDoc(collectionName: string, id: string): Promise<any | null> {
+  if (isUsingClient) {
+    const snap = await withTimeout(getDoc(doc(clientDb, collectionName, id)), 4000, null);
+    return snap && snap.exists() ? snap.data() : null;
+  }
+  const snap = await withTimeout(adminDb.collection(collectionName).doc(id).get(), 4000, null);
+  return snap && snap.exists ? snap.data() : null;
+}
+
+async function dbSetDoc(collectionName: string, id: string, data: any): Promise<void> {
+  if (isUsingClient) {
+    await withTimeout(setDoc(doc(clientDb, collectionName, id), data), 4000, null);
+  } else {
+    await withTimeout(adminDb.collection(collectionName).doc(id).set(data), 4000, null);
+  }
+}
+
+async function dbDeleteDoc(collectionName: string, id: string): Promise<void> {
+  if (isUsingClient) {
+    await withTimeout(deleteDoc(doc(clientDb, collectionName, id)), 4000, null);
+  } else {
+    await withTimeout(adminDb.collection(collectionName).doc(id).delete(), 4000, null);
+  }
+}
+
+function clientIpHash(req: any): string {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
+  const rawIp = typeof ip === 'string'
+    ? ip.split(',')[0].trim()
+    : Array.isArray(ip) ? ip[0].trim() : '';
+  return rawIp ? crypto.createHash('sha256').update(rawIp).digest('hex') : 'unknown';
+}
+
 app.post("/api/request-otp", async (req, res) => {
+  if (!SERVER_PEPPER) {
+    res.status(500).json({ error: "Sunucu yapılandırması eksik. Lütfen daha sonra tekrar deneyin." });
+    return;
+  }
+
   const { contact } = req.body;
   if (!contact || typeof contact !== 'string') {
     res.status(400).json({ error: "Geçersiz iletişim bilgisi." });
@@ -310,30 +394,83 @@ app.post("/api/request-otp", async (req, res) => {
   }
 
   const normalized = normalizeContact(contact);
-  if (!normalized) {
-    res.status(400).json({ error: "Geçersiz e-posta veya telefon numarası." });
+  // Email-only verification (chosen channel). Phone OTP is not delivered.
+  if (!normalized || !isEmail(normalized)) {
+    res.status(400).json({ error: "Lütfen geçerli bir e-posta adresi girin." });
     return;
   }
 
-  // Generate 6-digit code
-  const code = Math.floor(100000 + Math.random() * 900000).toString();
   const credentialId = hashCredential(normalized);
-  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const now = Date.now();
 
-  if (adminDb || clientDb) {
-    try {
-      if (isUsingClient) {
-        await withTimeout(setDoc(doc(clientDb, 'otps', credentialId), { code, expiresAt }), 4000, null);
-      } else {
-        await withTimeout(adminDb.collection('otps').doc(credentialId).set({ code, expiresAt }), 4000, null);
-      }
-    } catch (error) {
-      console.error("Failed to write OTP to Firestore:", error);
+  // If this credential has already cast its vote, don't bother sending a code.
+  try {
+    const voter = await dbGetDoc('voters', credentialId);
+    if (voter && (voter.status === 'used' || voter.used === true)) {
+      res.status(400).json({ error: "Bu kimlikle zaten oy kullanıldı." });
+      return;
     }
+  } catch (error) {
+    console.error("Failed to read voter state in request-otp:", error);
   }
 
-  console.log(`[OTP SEND MOCK] Send code ${code} to normalized contact ${normalized}`);
+  // Rate limiting: cooldown between sends + capped sends per rolling window.
+  let sendCount = 0;
+  let windowStart = now;
+  try {
+    const existing = await dbGetDoc('otps', credentialId);
+    if (existing) {
+      const lastSentAt = existing.lastSentAt ? new Date(existing.lastSentAt).getTime() : 0;
+      if (now - lastSentAt < OTP_RESEND_COOLDOWN_MS) {
+        res.status(429).json({ error: "Lütfen yeni kod istemeden önce biraz bekleyin." });
+        return;
+      }
+      windowStart = existing.windowStart ? new Date(existing.windowStart).getTime() : now;
+      if (now - windowStart > OTP_SEND_WINDOW_MS) {
+        windowStart = now; // window expired, reset
+        sendCount = 0;
+      } else {
+        sendCount = existing.sendCount || 0;
+      }
+      if (sendCount >= OTP_MAX_SENDS_PER_WINDOW) {
+        res.status(429).json({ error: "Çok fazla kod talebi. Lütfen bir süre sonra tekrar deneyin." });
+        return;
+      }
+    }
+  } catch (error) {
+    console.error("Failed to read OTP rate-limit state:", error);
+  }
 
+  // Generate 6-digit code; store only its hash (bound to credential).
+  const code = crypto.randomInt(100000, 1000000).toString();
+  const codeHash = hashCode(code, credentialId);
+  const expiresAt = new Date(now + OTP_TTL_MS).toISOString();
+
+  try {
+    await dbSetDoc('otps', credentialId, {
+      codeHash,
+      expiresAt,
+      attempts: 0,
+      sendCount: sendCount + 1,
+      lastSentAt: new Date(now).toISOString(),
+      windowStart: new Date(windowStart).toISOString(),
+    });
+  } catch (error) {
+    console.error("Failed to write OTP to Firestore:", error);
+    res.status(500).json({ error: "Kod oluşturulamadı. Lütfen tekrar deneyin." });
+    return;
+  }
+
+  // Deliver via the configured sender (Resend in production).
+  try {
+    await getOtpSender().send(normalized, code);
+  } catch (error) {
+    console.error("Failed to deliver OTP:", error);
+    res.status(502).json({ error: "Doğrulama kodu gönderilemedi. Lütfen tekrar deneyin." });
+    return;
+  }
+
+  // Only echo the code back in non-production to ease local testing.
   if (process.env.NODE_ENV !== 'production') {
     res.json({ success: true, code });
   } else {
@@ -342,6 +479,11 @@ app.post("/api/request-otp", async (req, res) => {
 });
 
 app.post("/api/verify-otp", async (req, res) => {
+  if (!SERVER_PEPPER) {
+    res.status(500).json({ error: "Sunucu yapılandırması eksik. Lütfen daha sonra tekrar deneyin." });
+    return;
+  }
+
   const { contact, code } = req.body;
   if (!contact || !code) {
     res.status(400).json({ error: "Eksik bilgi." });
@@ -349,54 +491,79 @@ app.post("/api/verify-otp", async (req, res) => {
   }
 
   const normalized = normalizeContact(contact);
+  if (!normalized || !isEmail(normalized)) {
+    res.status(400).json({ error: "Lütfen geçerli bir e-posta adresi girin." });
+    return;
+  }
   const credentialId = hashCredential(normalized);
 
   let otpDoc: any = null;
-
-  if (adminDb || clientDb) {
-    try {
-      if (isUsingClient) {
-        const snap = await withTimeout(getDoc(doc(clientDb, 'otps', credentialId)), 4000, null);
-        otpDoc = snap && snap.exists() ? snap.data() : null;
-      } else {
-        const snap = await withTimeout(adminDb.collection('otps').doc(credentialId).get(), 4000, null);
-        otpDoc = snap && snap.exists ? snap.data() : null;
-      }
-    } catch (error) {
-      console.error("Failed to fetch OTP from Firestore:", error);
-    }
+  try {
+    otpDoc = await dbGetDoc('otps', credentialId);
+  } catch (error) {
+    console.error("Failed to fetch OTP from Firestore:", error);
   }
 
-  if (!otpDoc || otpDoc.code !== code.trim()) {
-    res.status(400).json({ error: "Doğrulama kodu hatalı." });
+  if (!otpDoc) {
+    res.status(400).json({ error: "Doğrulama kodu bulunamadı. Lütfen yeni kod isteyin." });
+    return;
+  }
+
+  // Brute-force lockout: too many wrong guesses invalidates the code entirely.
+  if ((otpDoc.attempts || 0) >= OTP_MAX_VERIFY_ATTEMPTS) {
+    try { await dbDeleteDoc('otps', credentialId); } catch {}
+    res.status(429).json({ error: "Çok fazla hatalı deneme. Lütfen yeni kod isteyin." });
     return;
   }
 
   if (new Date(otpDoc.expiresAt) < new Date()) {
+    try { await dbDeleteDoc('otps', credentialId); } catch {}
     res.status(400).json({ error: "Doğrulama kodunun süresi dolmuş." });
     return;
   }
 
-  if (adminDb || clientDb) {
+  const submittedHash = hashCode(String(code).trim(), credentialId);
+  const expectedHash = String(otpDoc.codeHash || '');
+  const matches = expectedHash.length > 0 &&
+    submittedHash.length === expectedHash.length &&
+    crypto.timingSafeEqual(Buffer.from(submittedHash), Buffer.from(expectedHash));
+
+  if (!matches) {
+    // Increment attempt counter; preserve the rest of the OTP doc.
     try {
-      if (isUsingClient) {
-        await withTimeout(setDoc(doc(clientDb, 'voters', credentialId), {
-          status: 'verified',
-          verifiedAt: new Date().toISOString(),
-          used: false
-        }), 4000, null);
-        await withTimeout(deleteDoc(doc(clientDb, 'otps', credentialId)), 4000, null);
-      } else {
-        await withTimeout(adminDb.collection('voters').doc(credentialId).set({
-          status: 'verified',
-          verifiedAt: FieldValue.serverTimestamp(),
-          used: false
-        }), 4000, null);
-        await withTimeout(adminDb.collection('otps').doc(credentialId).delete(), 4000, null);
-      }
+      await dbSetDoc('otps', credentialId, { ...otpDoc, attempts: (otpDoc.attempts || 0) + 1 });
     } catch (error) {
-      console.error("Failed to write voter verification to Firestore:", error);
+      console.error("Failed to record failed OTP attempt:", error);
     }
+    res.status(400).json({ error: "Doğrulama kodu hatalı." });
+    return;
+  }
+
+  // Success: mark the credential verified (idempotent) and consume the OTP.
+  // Do NOT reset an already-used voter back to verified.
+  try {
+    const existingVoter = await dbGetDoc('voters', credentialId);
+    if (existingVoter && (existingVoter.status === 'used' || existingVoter.used === true)) {
+      try { await dbDeleteDoc('otps', credentialId); } catch {}
+      res.status(400).json({ error: "Bu kimlikle zaten oy kullanıldı." });
+      return;
+    }
+    if (isUsingClient) {
+      await withTimeout(setDoc(doc(clientDb, 'voters', credentialId), {
+        status: 'verified',
+        verifiedAt: new Date().toISOString(),
+        used: false
+      }), 4000, null);
+    } else {
+      await withTimeout(adminDb.collection('voters').doc(credentialId).set({
+        status: 'verified',
+        verifiedAt: FieldValue.serverTimestamp(),
+        used: false
+      }), 4000, null);
+    }
+    await dbDeleteDoc('otps', credentialId);
+  } catch (error) {
+    console.error("Failed to write voter verification to Firestore:", error);
   }
 
   res.json({ success: true, credentialId });
@@ -420,14 +587,8 @@ app.post("/api/vote", async (req, res) => {
     return;
   }
 
-  // Resolve IP Address & Hash it
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
-  const rawIp = typeof ip === 'string' 
-    ? ip.split(',')[0].trim() 
-    : Array.isArray(ip) 
-      ? ip[0].trim() 
-      : '';
-  const ipHash = rawIp ? crypto.createHash('sha256').update(rawIp).digest('hex') : 'unknown';
+  // Resolve IP Address & Hash it (used as a secondary abuse signal only)
+  const ipHash = clientIpHash(req);
   const userAgent = req.headers['user-agent'] || 'unknown';
 
   const isSecure = process.env.SECURE_VOTING_ENABLED !== "false";
@@ -435,6 +596,11 @@ app.post("/api/vote", async (req, res) => {
 
   // If Secure Voting is Enabled: Transactional Credential Single-Cast
   if (isSecure) {
+    if (!SERVER_PEPPER) {
+      res.status(500).json({ error: "Sunucu yapılandırması eksik. Lütfen daha sonra tekrar deneyin." });
+      return;
+    }
+
     if (!credentialId) {
       res.status(400).json({ error: "Oy kullanmak için doğrulama gerekli." });
       return;

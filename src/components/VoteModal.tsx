@@ -256,16 +256,16 @@ export function VoteModal({ mayor, onClose, onSuccess }: VoteModalProps) {
             <form onSubmit={handleRequestOtp} className="space-y-6">
               <div className="space-y-2">
                 <label className="text-sm md:text-base font-bold uppercase tracking-wider block">
-                  KİMLİK DOĞRULAMA (E-POSTA VEYA TELEFON)
+                  KİMLİK DOĞRULAMA (E-POSTA)
                 </label>
                 <p className="text-xs opacity-70 leading-relaxed">
-                  Güvenli anket katılımı ve tek kişi tek oy ilkesini korumak amacıyla e-posta veya telefon doğrulaması gerekmektedir. İletişim bilgileriniz şifrelenir (SHA-256) ve kesinlikle oylarınızla ilişkilendirilmez.
+                  Güvenli anket katılımı ve tek kişi tek oy ilkesini korumak amacıyla e-posta doğrulaması gerekmektedir. E-posta adresiniz şifrelenir (SHA-256) ve kesinlikle oylarınızla ilişkilendirilmez.
                 </p>
                 <input
-                  type="text"
-                  placeholder="örnek@eposta.com veya 05338XXXXXX"
+                  type="email"
+                  placeholder="örnek@eposta.com"
                   value={contact}
-                  onChange={(e) => setContact(e.target.value)}
+                  onChange={(e) => setContact(e.target.value.trim())}
                   className="w-full border-4 border-[#1a1a1a] p-3 text-base focus:outline-none focus:bg-orange-50/50 bg-white font-mono"
                   required
                 />

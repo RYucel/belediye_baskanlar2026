@@ -1,8 +1,16 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // Deny ALL direct client access.
+    //
+    // The browser frontend never talks to Firestore directly — it only calls
+    // the /api/* endpoints. On Vercel the server uses the Firebase Admin SDK,
+    // which bypasses these rules entirely. Denying everything here closes the
+    // hole where anyone with the public Firebase web config could read OTP
+    // codes, flip `voters` docs back to unused, forge ballots, or wipe data —
+    // which would completely defeat the server-side single-cast guarantee.
     match /{document=**} {
-      allow read, write: if true;
+      allow read, write: if false;
     }
   }
 }
