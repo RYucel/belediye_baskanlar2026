@@ -7,10 +7,9 @@ interface MayorCardProps {
   mayor: Mayor;
   rank: number;
   onVoteClick: (mayor: Mayor) => void;
-  onNewsClick: (mayor: Mayor) => void;
 }
 
-export function MayorCard({ mayor, rank, onVoteClick, onNewsClick }: MayorCardProps) {
+export function MayorCard({ mayor, rank, onVoteClick }: MayorCardProps) {
   
   const getPartyColor = (party: string) => {
     switch (party.toUpperCase()) {
@@ -86,12 +85,6 @@ export function MayorCard({ mayor, rank, onVoteClick, onNewsClick }: MayorCardPr
           </div>
         </div>
         <div className="flex gap-2">
-          <button
-            onClick={() => onNewsClick(mayor)}
-            className="text-xs font-bold uppercase tracking-widest border-2 border-[#1a1a1a] px-3 py-2 hover:bg-[#1a1a1a] hover:text-white transition-colors"
-          >
-            HABER
-          </button>
           <button
             onClick={() => onVoteClick(mayor)}
             className="text-xs font-bold uppercase tracking-widest bg-orange-500 text-[#1a1a1a] border-2 border-orange-500 px-3 py-2 hover:bg-[#1a1a1a] hover:text-orange-500 transition-colors"

@@ -1,6 +1,5 @@
 import express from "express";
 import path from "path";
-import { GoogleGenAI } from "@google/genai";
 import { initializeApp as initializeAdminApp, cert, getApps as getAdminApps } from 'firebase-admin/app';
 import { getFirestore as getAdminFirestore, FieldValue } from 'firebase-admin/firestore';
 import { initializeApp as initializeClientApp } from 'firebase/app';
@@ -13,21 +12,6 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.use(express.json());
 
-let aiClient: GoogleGenAI | null = null;
-
-function getAiClient() {
-  if (!aiClient) {
-    aiClient = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY || "dummy-key-to-prevent-crash",
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        }
-      }
-    });
-  }
-  return aiClient;
-}
 
 // Firebase Init
 let adminDb: any;
@@ -367,41 +351,6 @@ app.post("/api/vote", async (req, res) => {
   res.json({ success: true });
 });
 
-app.post("/api/mayor/news", async (req, res) => {
-  const { name, city } = req.body;
-  if (!name || !city) {
-    res.status(400).json({ error: "İsim veya şehir eksik." });
-    return;
-  }
-  
-  try {
-    const response = await getAiClient().models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: `KKTC ${city} Belediye Başkanı ${name} hakkında en son çıkan haberleri, icraatlarını veya güncel gelişmeleri özetle. Yanıtın kısa, tarafsız ve sadece haber odaklı olsun. Eğer yeni bir bilgi yoksa genel bilgi ver. Sadece Türkçe yanıt ver.`,
-      config: {
-        tools: [{ googleSearch: {} }],
-        systemInstruction: "You are a helpful assistant providing neutral, up-to-date news summaries."
-      },
-    });
-    
-    // Extract URLs if available
-    const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
-    let sources: {uri: string, title: string}[] = [];
-    if (chunks) {
-      sources = chunks
-        .filter((chunk: any) => chunk.web?.uri && chunk.web?.title)
-        .map((chunk: any) => ({
-          uri: chunk.web.uri,
-          title: chunk.web.title
-        }));
-    }
-
-    res.json({ text: response.text, sources });
-  } catch (error) {
-    console.error("Gemini Error:", error);
-    res.status(500).json({ error: "Haberler alınırken bir hata oluştu." });
-  }
-});
 
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {

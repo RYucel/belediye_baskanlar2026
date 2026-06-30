@@ -2,7 +2,6 @@ import React, { useState, useEffect } from 'react';
 import { Mayor } from './types';
 import { MayorCard } from './components/MayorCard';
 import { VoteModal } from './components/VoteModal';
-import { NewsWidget } from './components/NewsWidget';
 import { RefreshCw } from 'lucide-react';
 
 export default function App() {
@@ -10,7 +9,6 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   
   const [votingMayor, setVotingMayor] = useState<Mayor | null>(null);
-  const [newsMayor, setNewsMayor] = useState<Mayor | null>(null);
 
   const fetchMayors = async () => {
     setLoading(true);
@@ -131,7 +129,6 @@ export default function App() {
                       mayor={mayor}
                       rank={index + 1}
                       onVoteClick={setVotingMayor}
-                      onNewsClick={setNewsMayor}
                     />
                   ))
                 )}
@@ -179,12 +176,7 @@ export default function App() {
         />
       )}
 
-      {newsMayor && (
-        <NewsWidget 
-          mayor={newsMayor} 
-          onClose={() => setNewsMayor(null)} 
-        />
-      )}
+      {/* NewsWidget modal removed */}
     </div>
   );
 }
