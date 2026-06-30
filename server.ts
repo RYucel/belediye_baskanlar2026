@@ -13,14 +13,21 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    }
+let aiClient: GoogleGenAI | null = null;
+
+function getAiClient() {
+  if (!aiClient) {
+    aiClient = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY || "dummy-key-to-prevent-crash",
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        }
+      }
+    });
   }
-});
+  return aiClient;
+}
 
 // Firebase Init
 let adminDb: any;
@@ -347,7 +354,7 @@ app.post("/api/mayor/news", async (req, res) => {
   }
   
   try {
-    const response = await ai.models.generateContent({
+    const response = await getAiClient().models.generateContent({
       model: "gemini-3.5-flash",
       contents: `KKTC ${city} Belediye Başkanı ${name} hakkında en son çıkan haberleri, icraatlarını veya güncel gelişmeleri özetle. Yanıtın kısa, tarafsız ve sadece haber odaklı olsun. Eğer yeni bir bilgi yoksa genel bilgi ver. Sadece Türkçe yanıt ver.`,
       config: {
