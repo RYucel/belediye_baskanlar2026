@@ -28,22 +28,9 @@ try {
           credential: cert(serviceAccount)
         });
     
-    // Resolve custom Firestore database ID if available
-    let databaseId = "(default)";
-    const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
-    if (fs.existsSync(configPath)) {
-      try {
-        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        if (config.firestoreDatabaseId) {
-          databaseId = config.firestoreDatabaseId;
-        }
-      } catch (err) {
-        console.warn("Could not parse database ID from config:", err);
-      }
-    }
-    if (process.env.FIREBASE_DATABASE_ID) {
-      databaseId = process.env.FIREBASE_DATABASE_ID;
-    }
+    // For Vercel production, default to "(default)" unless FIREBASE_DATABASE_ID is explicitly set.
+    // Do NOT fall back to the local AI Studio sandbox database ID in firebase-applet-config.json.
+    const databaseId = process.env.FIREBASE_DATABASE_ID || "(default)";
     
     adminDb = getAdminFirestore(firebaseApp, databaseId);
     console.log(`Firebase initialized successfully from Service Account (Vercel) on database: ${databaseId}`);
