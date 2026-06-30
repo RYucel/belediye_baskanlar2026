@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Mayor } from '../types';
 import { X, Star } from 'lucide-react';
 import { useDeviceId, generateFingerprint } from '../lib/useDeviceId';
@@ -27,19 +27,31 @@ export function VoteModal({ mayor, onClose, onSuccess }: VoteModalProps) {
   const [error, setError] = useState<string>('');
   const [submitting, setSubmitting] = useState(false);
 
+  // Secure Verification States
+  const [secureVotingEnabled, setSecureVotingEnabled] = useState(false);
+  const [step, setStep] = useState<'rating' | 'otp_request' | 'otp_verify'>('rating');
+  const [contact, setContact] = useState('');
+  const [otpCode, setOtpCode] = useState('');
+  const [credentialId, setCredentialId] = useState(() => localStorage.getItem('kktc_credentialId') || '');
+  const [idempotencyKey] = useState(() => Math.random().toString(36).substring(2) + Date.now().toString(36));
+
+  useEffect(() => {
+    // Load config from server to check if secure voting feature is enabled
+    fetch('/api/config')
+      .then(res => res.json())
+      .then(data => {
+        if (data && data.secureVotingEnabled) {
+          setSecureVotingEnabled(true);
+        }
+      })
+      .catch(err => console.error("Error loading config:", err));
+  }, []);
+
   const handleStarClick = (criterion: string, value: number) => {
     setRatings((prev) => ({ ...prev, [criterion]: value }));
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    
-    // Validate
-    if (Object.values(ratings).some((val) => val === 0)) {
-      setError('Tüm kriterler için puan veriniz.');
-      return;
-    }
-
+  const submitVote = async (verifiedCredId: string) => {
     setSubmitting(true);
     setError('');
 
@@ -50,6 +62,8 @@ export function VoteModal({ mayor, onClose, onSuccess }: VoteModalProps) {
         body: JSON.stringify({
           deviceId,
           fingerprint: generateFingerprint(),
+          credentialId: verifiedCredId || undefined,
+          idempotencyKey,
           mayorId: mayor.id,
           rating: ratings,
         }),
@@ -62,6 +76,97 @@ export function VoteModal({ mayor, onClose, onSuccess }: VoteModalProps) {
       }
 
       onSuccess();
+    } catch (err: any) {
+      setError(err.message);
+      // Revert step back to rating so they can review or retry
+      setStep('rating');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    
+    // Validate ratings
+    if (Object.values(ratings).some((val) => val === 0)) {
+      setError('Tüm kriterler için puan veriniz.');
+      return;
+    }
+
+    setError('');
+
+    // If secure voting is enabled and the user is not yet verified, transition to OTP request
+    if (secureVotingEnabled && !credentialId) {
+      setStep('otp_request');
+    } else {
+      await submitVote(credentialId);
+    }
+  };
+
+  const handleRequestOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!contact.trim()) {
+      setError('Lütfen e-posta veya telefon numaranızı girin.');
+      return;
+    }
+
+    setSubmitting(true);
+    setError('');
+
+    try {
+      const response = await fetch('/api/request-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contact }),
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Kod gönderilemedi.');
+      }
+
+      // Help local testing by displaying the OTP in console
+      if (data.code) {
+        console.log(`[DEV ONLY] OTP Code: ${data.code}`);
+      }
+
+      setStep('otp_verify');
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleVerifyOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!otpCode.trim()) {
+      setError('Lütfen 6 haneli doğrulama kodunu girin.');
+      return;
+    }
+
+    setSubmitting(true);
+    setError('');
+
+    try {
+      const response = await fetch('/api/verify-otp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contact, code: otpCode }),
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Kod doğrulanamadı.');
+      }
+
+      const verifiedId = data.credentialId;
+      setCredentialId(verifiedId);
+      localStorage.setItem('kktc_credentialId', verifiedId);
+
+      // Automatically cast the vote after successful verification
+      await submitVote(verifiedId);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -89,58 +194,153 @@ export function VoteModal({ mayor, onClose, onSuccess }: VoteModalProps) {
 
         {/* Content */}
         <div className="overflow-y-auto px-6 py-6 flex-1 text-[#1a1a1a]">
-          <p className="mb-8 font-serif italic text-base opacity-80 border-l-2 border-orange-500 pl-4">
-            Adil bir değerlendirme için lütfen her bir kriteri dikkatlice puanlayın.
-          </p>
+          
+          {step === 'rating' && (
+            <>
+              <p className="mb-8 font-serif italic text-base opacity-80 border-l-2 border-orange-500 pl-4">
+                Adil bir değerlendirme için lütfen her bir kriteri dikkatlice puanlayın.
+              </p>
 
-          <form onSubmit={handleSubmit} className="space-y-6">
-            {CRITERIA.map((criterion) => (
-              <div key={criterion.id} className="space-y-1">
-                <div className="flex justify-between items-end border-b border-gray-200 pb-2">
-                  <label className="text-sm md:text-base font-bold uppercase tracking-wider">
-                    {criterion.label}
-                  </label>
-                  <span className="text-xs font-mono font-bold">
-                    {ratings[criterion.id] > 0 ? `${ratings[criterion.id]}/10` : 'BEKLİYOR'}
-                  </span>
-                </div>
-                <div className="flex gap-0.5 pt-1">
-                  {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((star) => (
-                    <button
-                      key={star}
-                      type="button"
-                      onClick={() => handleStarClick(criterion.id, star)}
-                      className="group p-1 focus:outline-none"
-                    >
-                      <Star
-                        className={`h-5 w-5 md:h-6 md:w-6 transition-colors ${
-                          star <= ratings[criterion.id]
-                            ? 'fill-[#1a1a1a] text-[#1a1a1a]'
-                            : 'fill-transparent text-gray-300 group-hover:text-gray-500'
-                        }`}
-                      />
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ))}
+              <form onSubmit={handleSubmit} className="space-y-6">
+                {CRITERIA.map((criterion) => (
+                  <div key={criterion.id} className="space-y-1">
+                    <div className="flex justify-between items-end border-b border-gray-200 pb-2">
+                      <label className="text-sm md:text-base font-bold uppercase tracking-wider">
+                        {criterion.label}
+                      </label>
+                      <span className="text-xs font-mono font-bold">
+                        {ratings[criterion.id] > 0 ? `${ratings[criterion.id]}/10` : 'BEKLİYOR'}
+                      </span>
+                    </div>
+                    <div className="flex gap-0.5 pt-1">
+                      {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((star) => (
+                        <button
+                          key={star}
+                          type="button"
+                          onClick={() => handleStarClick(criterion.id, star)}
+                          className="group p-1 focus:outline-none"
+                        >
+                          <Star
+                            className={`h-5 w-5 md:h-6 md:w-6 transition-colors ${
+                              star <= ratings[criterion.id]
+                                ? 'fill-[#1a1a1a] text-[#1a1a1a]'
+                                : 'fill-transparent text-gray-300 group-hover:text-gray-500'
+                            }`}
+                          />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
 
-            {error && (
-              <div className="bg-[#1a1a1a] p-4 text-sm text-white font-mono uppercase">
-                HATA: {error}
+                {error && (
+                  <div className="bg-[#1a1a1a] p-4 text-sm text-white font-mono uppercase">
+                    HATA: {error}
+                  </div>
+                )}
+                
+                <div className="pt-6">
+                  <button
+                    type="submit"
+                    disabled={submitting}
+                    className="w-full bg-[#1a1a1a] px-4 py-4 text-base font-bold tracking-widest uppercase text-white hover:bg-orange-500 hover:text-[#1a1a1a] disabled:opacity-50 transition-colors border-2 border-[#1a1a1a]"
+                  >
+                    {submitting ? 'İŞLENİYOR...' : 'OYU KAYDET →'}
+                  </button>
+                </div>
+              </form>
+            </>
+          )}
+
+          {step === 'otp_request' && (
+            <form onSubmit={handleRequestOtp} className="space-y-6">
+              <div className="space-y-2">
+                <label className="text-sm md:text-base font-bold uppercase tracking-wider block">
+                  KİMLİK DOĞRULAMA (E-POSTA VEYA TELEFON)
+                </label>
+                <p className="text-xs opacity-70 leading-relaxed">
+                  Güvenli anket katılımı ve tek kişi tek oy ilkesini korumak amacıyla e-posta veya telefon doğrulaması gerekmektedir. İletişim bilgileriniz şifrelenir (SHA-256) ve kesinlikle oylarınızla ilişkilendirilmez.
+                </p>
+                <input
+                  type="text"
+                  placeholder="örnek@eposta.com veya 05338XXXXXX"
+                  value={contact}
+                  onChange={(e) => setContact(e.target.value)}
+                  className="w-full border-4 border-[#1a1a1a] p-3 text-base focus:outline-none focus:bg-orange-50/50 bg-white font-mono"
+                  required
+                />
               </div>
-            )}
-            
-            <div className="pt-6">
-              <button
-                type="submit"
-                disabled={submitting}
-                className="w-full bg-[#1a1a1a] px-4 py-4 text-base font-bold tracking-widest uppercase text-white hover:bg-orange-500 hover:text-[#1a1a1a] disabled:opacity-50 transition-colors border-2 border-[#1a1a1a]"
-              >
-                {submitting ? 'İŞLENİYOR...' : 'OYU KAYDET →'}
-              </button>
-            </div>
-          </form>
+
+              {error && (
+                <div className="bg-[#1a1a1a] p-4 text-sm text-white font-mono uppercase">
+                  HATA: {error}
+                </div>
+              )}
+
+              <div className="flex gap-4 pt-6">
+                <button
+                  type="button"
+                  onClick={() => setStep('rating')}
+                  className="w-1/3 bg-white px-4 py-4 text-base font-bold tracking-widest uppercase text-[#1a1a1a] hover:bg-gray-100 transition-colors border-2 border-[#1a1a1a]"
+                >
+                  ← GERİ
+                </button>
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="w-2/3 bg-[#1a1a1a] px-4 py-4 text-base font-bold tracking-widest uppercase text-white hover:bg-orange-500 hover:text-[#1a1a1a] disabled:opacity-50 transition-colors border-2 border-[#1a1a1a]"
+                >
+                  {submitting ? 'KOD GÖNDERİLİYOR...' : 'KOD GÖNDER →'}
+                </button>
+              </div>
+            </form>
+          )}
+
+          {step === 'otp_verify' && (
+            <form onSubmit={handleVerifyOtp} className="space-y-6">
+              <div className="space-y-2">
+                <label className="text-sm md:text-base font-bold uppercase tracking-wider block">
+                  DOĞRULAMA KODUNU GİRİN
+                </label>
+                <p className="text-xs opacity-70 leading-relaxed">
+                  Lütfen <strong>{contact}</strong> adresine gönderilen 6 haneli doğrulama kodunu girin.
+                </p>
+                <input
+                  type="text"
+                  maxLength={6}
+                  placeholder="123456"
+                  value={otpCode}
+                  onChange={(e) => setOtpCode(e.target.value)}
+                  className="w-full border-4 border-[#1a1a1a] p-3 text-center text-2xl font-mono tracking-widest focus:outline-none focus:bg-orange-50/50 bg-white"
+                  required
+                />
+              </div>
+
+              {error && (
+                <div className="bg-[#1a1a1a] p-4 text-sm text-white font-mono uppercase">
+                  HATA: {error}
+                </div>
+              )}
+
+              <div className="flex gap-4 pt-6">
+                <button
+                  type="button"
+                  onClick={() => setStep('otp_request')}
+                  className="w-1/3 bg-white px-4 py-4 text-base font-bold tracking-widest uppercase text-[#1a1a1a] hover:bg-gray-100 transition-colors border-2 border-[#1a1a1a]"
+                >
+                  ← GERİ
+                </button>
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="w-2/3 bg-[#1a1a1a] px-4 py-4 text-base font-bold tracking-widest uppercase text-white hover:bg-orange-500 hover:text-[#1a1a1a] disabled:opacity-50 transition-colors border-2 border-[#1a1a1a]"
+                >
+                  {submitting ? 'DOĞRULANIYOR...' : 'KODU DOĞRULA →'}
+                </button>
+              </div>
+            </form>
+          )}
+
         </div>
       </div>
     </div>

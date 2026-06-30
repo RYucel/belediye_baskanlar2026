@@ -3,7 +3,7 @@ import path from "path";
 import { initializeApp as initializeAdminApp, cert, getApps as getAdminApps } from 'firebase-admin/app';
 import { getFirestore as getAdminFirestore, FieldValue } from 'firebase-admin/firestore';
 import { initializeApp as initializeClientApp } from 'firebase/app';
-import { getFirestore as getClientFirestore, collection, getDocs, doc, getDoc, setDoc, query, where } from 'firebase/firestore';
+import { getFirestore as getClientFirestore, collection, getDocs, doc, getDoc, setDoc, query, where, deleteDoc, runTransaction } from 'firebase/firestore';
 import fs from 'fs';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
@@ -220,17 +220,25 @@ function withTimeout<T>(promise: Promise<T>, ms: number, fallbackValue: T): Prom
 }
 
 // API Routes
+app.get("/api/config", (req, res) => {
+  res.json({
+    secureVotingEnabled: process.env.SECURE_VOTING_ENABLED === "true"
+  });
+});
+
 app.get("/api/mayors", async (req, res) => {
   try {
+    const isSecure = process.env.SECURE_VOTING_ENABLED === "true";
+    const collectionName = isSecure ? "ballots" : "votes";
     let allVotes: any[] = [];
     
     if (adminDb || clientDb) {
       try {
         if (isUsingClient) {
-          const snapshot = await withTimeout(getDocs(collection(clientDb, 'votes')), 4000, null);
+          const snapshot = await withTimeout(getDocs(collection(clientDb, collectionName)), 4000, null);
           allVotes = snapshot ? snapshot.docs.map(d => d.data()) : Array.from(memoryVotes.values());
         } else {
-          const snapshot = await withTimeout(adminDb.collection('votes').get(), 4000, null);
+          const snapshot = await withTimeout(adminDb.collection(collectionName).get(), 4000, null);
           allVotes = snapshot ? snapshot.docs.map((d: any) => d.data()) : Array.from(memoryVotes.values());
         }
       } catch (err) {
@@ -280,8 +288,122 @@ app.get("/api/mayors", async (req, res) => {
   }
 });
 
+const SERVER_PEPPER = process.env.SERVER_PEPPER || "kktc-belediye-voting-pepper-2026-secure-secret-key";
+
+function normalizeContact(contact: string): string {
+  const clean = contact.trim().toLowerCase();
+  if (clean.includes('@')) {
+    return clean;
+  }
+  return clean.replace(/\D/g, '');
+}
+
+function hashCredential(normalizedContact: string): string {
+  return crypto.createHash('sha256').update(normalizedContact + SERVER_PEPPER).digest('hex');
+}
+
+app.post("/api/request-otp", async (req, res) => {
+  const { contact } = req.body;
+  if (!contact || typeof contact !== 'string') {
+    res.status(400).json({ error: "Geçersiz iletişim bilgisi." });
+    return;
+  }
+
+  const normalized = normalizeContact(contact);
+  if (!normalized) {
+    res.status(400).json({ error: "Geçersiz e-posta veya telefon numarası." });
+    return;
+  }
+
+  // Generate 6-digit code
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  const credentialId = hashCredential(normalized);
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+  if (adminDb || clientDb) {
+    try {
+      if (isUsingClient) {
+        await withTimeout(setDoc(doc(clientDb, 'otps', credentialId), { code, expiresAt }), 4000, null);
+      } else {
+        await withTimeout(adminDb.collection('otps').doc(credentialId).set({ code, expiresAt }), 4000, null);
+      }
+    } catch (error) {
+      console.error("Failed to write OTP to Firestore:", error);
+    }
+  }
+
+  console.log(`[OTP SEND MOCK] Send code ${code} to normalized contact ${normalized}`);
+
+  if (process.env.NODE_ENV !== 'production') {
+    res.json({ success: true, code });
+  } else {
+    res.json({ success: true });
+  }
+});
+
+app.post("/api/verify-otp", async (req, res) => {
+  const { contact, code } = req.body;
+  if (!contact || !code) {
+    res.status(400).json({ error: "Eksik bilgi." });
+    return;
+  }
+
+  const normalized = normalizeContact(contact);
+  const credentialId = hashCredential(normalized);
+
+  let otpDoc: any = null;
+
+  if (adminDb || clientDb) {
+    try {
+      if (isUsingClient) {
+        const snap = await withTimeout(getDoc(doc(clientDb, 'otps', credentialId)), 4000, null);
+        otpDoc = snap && snap.exists() ? snap.data() : null;
+      } else {
+        const snap = await withTimeout(adminDb.collection('otps').doc(credentialId).get(), 4000, null);
+        otpDoc = snap && snap.exists ? snap.data() : null;
+      }
+    } catch (error) {
+      console.error("Failed to fetch OTP from Firestore:", error);
+    }
+  }
+
+  if (!otpDoc || otpDoc.code !== code.trim()) {
+    res.status(400).json({ error: "Doğrulama kodu hatalı." });
+    return;
+  }
+
+  if (new Date(otpDoc.expiresAt) < new Date()) {
+    res.status(400).json({ error: "Doğrulama kodunun süresi dolmuş." });
+    return;
+  }
+
+  if (adminDb || clientDb) {
+    try {
+      if (isUsingClient) {
+        await withTimeout(setDoc(doc(clientDb, 'voters', credentialId), {
+          status: 'verified',
+          verifiedAt: new Date().toISOString(),
+          used: false
+        }), 4000, null);
+        await withTimeout(deleteDoc(doc(clientDb, 'otps', credentialId)), 4000, null);
+      } else {
+        await withTimeout(adminDb.collection('voters').doc(credentialId).set({
+          status: 'verified',
+          verifiedAt: FieldValue.serverTimestamp(),
+          used: false
+        }), 4000, null);
+        await withTimeout(adminDb.collection('otps').doc(credentialId).delete(), 4000, null);
+      }
+    } catch (error) {
+      console.error("Failed to write voter verification to Firestore:", error);
+    }
+  }
+
+  res.json({ success: true, credentialId });
+});
+
 app.post("/api/vote", async (req, res) => {
-  const { deviceId, fingerprint, mayorId, rating } = req.body;
+  const { deviceId, fingerprint, credentialId, idempotencyKey, mayorId, rating } = req.body;
   
   if (!deviceId || !mayorId || !rating) {
     res.status(400).json({ error: "Eksik bilgi." });
@@ -306,9 +428,139 @@ app.post("/api/vote", async (req, res) => {
       ? ip[0].trim() 
       : '';
   const ipHash = rawIp ? crypto.createHash('sha256').update(rawIp).digest('hex') : 'unknown';
+  const userAgent = req.headers['user-agent'] || 'unknown';
 
-  const voteKey = `${deviceId}-${mayorId}`;
-  
+  const isSecure = process.env.SECURE_VOTING_ENABLED === "true";
+  const voteKey = idempotencyKey || `${deviceId}-${mayorId}`;
+
+  // If Secure Voting is Enabled: Transactional Credential Single-Cast
+  if (isSecure) {
+    if (!credentialId) {
+      res.status(400).json({ error: "Oy kullanmak için doğrulama gerekli." });
+      return;
+    }
+
+    if (process.env.ELECTION_CLOSED === "true") {
+      res.status(400).json({ error: "Oylama şu anda kapalı." });
+      return;
+    }
+
+    if (adminDb || clientDb) {
+      try {
+        if (isUsingClient) {
+          // Client SDK Transaction
+          await runTransaction(clientDb, async (transaction) => {
+            const voterRef = doc(clientDb, 'voters', credentialId);
+            const voterSnap = await transaction.get(voterRef);
+            if (!voterSnap.exists()) {
+              throw new Error("Oy kullanmak için doğrulama gerekli.");
+            }
+            if (voterSnap.data().status === 'used' || voterSnap.data().used === true) {
+              throw new Error("Bu kimlikle zaten oy kullanıldı.");
+            }
+            if (voterSnap.data().status !== 'verified') {
+              throw new Error("Oy kullanmak için doğrulama gerekli.");
+            }
+
+            const ballotRef = doc(clientDb, 'ballots', voteKey);
+            const ballotSnap = await transaction.get(ballotRef);
+            if (ballotSnap.exists()) {
+              return; // Idempotency check
+            }
+
+            // Perform single cast atomic writes
+            transaction.update(voterRef, { status: 'used', used: true, usedAt: new Date().toISOString() });
+            transaction.set(ballotRef, {
+              mayorId,
+              rating,
+              createdAt: new Date().toISOString()
+            });
+
+            // Write audit log inside transaction
+            const logRef = doc(collection(clientDb, 'audit_logs'));
+            transaction.set(logRef, {
+              action: 'vote_cast',
+              result: 'success',
+              ipHash,
+              fingerprint: fingerprint || 'unknown',
+              userAgent,
+              createdAt: new Date().toISOString()
+            });
+          });
+        } else {
+          // Admin SDK Transaction
+          await adminDb.runTransaction(async (transaction: any) => {
+            const voterRef = adminDb.collection('voters').doc(credentialId);
+            const voterSnap = await transaction.get(voterRef);
+            if (!voterSnap.exists) {
+              throw new Error("Oy kullanmak için doğrulama gerekli.");
+            }
+            if (voterSnap.data().status === 'used' || voterSnap.data().used === true) {
+              throw new Error("Bu kimlikle zaten oy kullanıldı.");
+            }
+            if (voterSnap.data().status !== 'verified') {
+              throw new Error("Oy kullanmak için doğrulama gerekli.");
+            }
+
+            const ballotRef = adminDb.collection('ballots').doc(voteKey);
+            const ballotSnap = await transaction.get(ballotRef);
+            if (ballotSnap.exists) {
+              return;
+            }
+
+            // Perform single cast atomic writes
+            transaction.update(voterRef, { status: 'used', used: true, usedAt: FieldValue.serverTimestamp() });
+            transaction.set(ballotRef, {
+              mayorId,
+              rating,
+              createdAt: FieldValue.serverTimestamp()
+            });
+
+            // Write audit log inside transaction
+            const logRef = adminDb.collection('audit_logs').doc();
+            transaction.set(logRef, {
+              action: 'vote_cast',
+              result: 'success',
+              ipHash,
+              fingerprint: fingerprint || 'unknown',
+              userAgent,
+              createdAt: FieldValue.serverTimestamp()
+            });
+          });
+        }
+
+        res.json({ success: true });
+        return;
+      } catch (error: any) {
+        console.warn("Secure voting transaction failed:", error);
+        
+        // Write failed audit log
+        try {
+          const logData = {
+            action: 'vote_cast',
+            result: 'failed',
+            reason: error.message || 'unknown',
+            ipHash,
+            fingerprint: fingerprint || 'unknown',
+            userAgent,
+            createdAt: new Date().toISOString()
+          };
+          if (isUsingClient) {
+            await setDoc(doc(collection(clientDb, 'audit_logs')), logData);
+          } else {
+            await adminDb.collection('audit_logs').doc().set(logData);
+          }
+        } catch (logErr) {
+          console.error("Failed to write audit log:", logErr);
+        }
+
+        res.status(400).json({ error: error.message || "İşlem başarısız." });
+        return;
+      }
+    }
+  }
+
+  // --- HEURISTIC VOTE FLOW (SECURE_VOTING_ENABLED = false) ---
   if (adminDb || clientDb) {
     try {
       if (isUsingClient) {
