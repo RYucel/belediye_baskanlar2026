@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Mayor } from '../types';
 import { X, Star } from 'lucide-react';
-import { useDeviceId } from '../lib/useDeviceId';
+import { useDeviceId, generateFingerprint } from '../lib/useDeviceId';
 
 interface VoteModalProps {
   mayor: Mayor;
@@ -49,6 +49,7 @@ export function VoteModal({ mayor, onClose, onSuccess }: VoteModalProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           deviceId,
+          fingerprint: generateFingerprint(),
           mayorId: mayor.id,
           rating: ratings,
         }),

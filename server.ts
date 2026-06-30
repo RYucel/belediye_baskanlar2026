@@ -3,8 +3,9 @@ import path from "path";
 import { initializeApp as initializeAdminApp, cert, getApps as getAdminApps } from 'firebase-admin/app';
 import { getFirestore as getAdminFirestore, FieldValue } from 'firebase-admin/firestore';
 import { initializeApp as initializeClientApp } from 'firebase/app';
-import { getFirestore as getClientFirestore, collection, getDocs, doc, getDoc, setDoc } from 'firebase/firestore';
+import { getFirestore as getClientFirestore, collection, getDocs, doc, getDoc, setDoc, query, where } from 'firebase/firestore';
 import fs from 'fs';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
 const app = express();
@@ -280,7 +281,7 @@ app.get("/api/mayors", async (req, res) => {
 });
 
 app.post("/api/vote", async (req, res) => {
-  const { deviceId, mayorId, rating } = req.body;
+  const { deviceId, fingerprint, mayorId, rating } = req.body;
   
   if (!deviceId || !mayorId || !rating) {
     res.status(400).json({ error: "Eksik bilgi." });
@@ -297,36 +298,88 @@ app.post("/api/vote", async (req, res) => {
     return;
   }
 
+  // Resolve IP Address & Hash it
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
+  const rawIp = typeof ip === 'string' 
+    ? ip.split(',')[0].trim() 
+    : Array.isArray(ip) 
+      ? ip[0].trim() 
+      : '';
+  const ipHash = rawIp ? crypto.createHash('sha256').update(rawIp).digest('hex') : 'unknown';
+
   const voteKey = `${deviceId}-${mayorId}`;
   
   if (adminDb || clientDb) {
     try {
       if (isUsingClient) {
-        const voteRef = doc(clientDb, 'votes', voteKey);
-        const docSnap = await withTimeout(getDoc(voteRef), 4000, null);
-        
-        if (docSnap && docSnap.exists()) {
-          res.status(400).json({ error: "Bu belediye başkanı için zaten oy kullandınız." });
+        // 1. One vote in total across all mayors per deviceId (UUID)
+        const qDevice = query(collection(clientDb, 'votes'), where('deviceId', '==', deviceId));
+        const deviceSnap = await withTimeout(getDocs(qDevice), 4000, null);
+        if (deviceSnap && !deviceSnap.empty) {
+          res.status(400).json({ error: "Zaten bir oy kullandınız. Sadece tek bir belediye başkanı için oy kullanabilirsiniz." });
           return;
         }
 
+        // 2. Max 2 votes per fingerprint
+        if (fingerprint) {
+          const qF = query(collection(clientDb, 'votes'), where('fingerprint', '==', fingerprint));
+          const fingerprintSnap = await withTimeout(getDocs(qF), 4000, null);
+          if (fingerprintSnap && fingerprintSnap.size >= 2) {
+            res.status(400).json({ error: "Cihaz limitine ulaşıldı. Bu tarayıcıdan en fazla 2 oy kullanılabilir." });
+            return;
+          }
+        }
+
+        // 3. Max 10 votes per IP hash (avoids blocking entire cellular towers but blocks bots)
+        if (ipHash !== 'unknown') {
+          const qIP = query(collection(clientDb, 'votes'), where('ipHash', '==', ipHash));
+          const ipSnap = await withTimeout(getDocs(qIP), 4000, null);
+          if (ipSnap && ipSnap.size >= 10) {
+            res.status(400).json({ error: "Aynı internet ağından maksimum oy limitine ulaşıldı." });
+            return;
+          }
+        }
+
+        const voteRef = doc(clientDb, 'votes', voteKey);
         await withTimeout(setDoc(voteRef, {
           deviceId,
+          fingerprint: fingerprint || 'unknown',
+          ipHash,
           mayorId,
           rating,
           createdAt: new Date().toISOString()
         }), 4000, null);
       } else {
-        const voteRef = adminDb.collection('votes').doc(voteKey);
-        const docSnap = await withTimeout(voteRef.get(), 4000, null);
-        
-        if (docSnap && docSnap.exists) {
-          res.status(400).json({ error: "Bu belediye başkanı için zaten oy kullandınız." });
+        // 1. One vote in total across all mayors per deviceId (UUID)
+        const deviceSnap = await withTimeout(adminDb.collection('votes').where('deviceId', '==', deviceId).limit(1).get(), 4000, null);
+        if (deviceSnap && !deviceSnap.empty) {
+          res.status(400).json({ error: "Zaten bir oy kullandınız. Sadece tek bir belediye başkanı için oy kullanabilirsiniz." });
           return;
         }
 
+        // 2. Max 2 votes per fingerprint
+        if (fingerprint) {
+          const fingerprintSnap = await withTimeout(adminDb.collection('votes').where('fingerprint', '==', fingerprint).get(), 4000, null);
+          if (fingerprintSnap && fingerprintSnap.size >= 2) {
+            res.status(400).json({ error: "Cihaz limitine ulaşıldı. Bu tarayıcıdan en fazla 2 oy kullanılabilir." });
+            return;
+          }
+        }
+
+        // 3. Max 10 votes per IP hash
+        if (ipHash !== 'unknown') {
+          const ipSnap = await withTimeout(adminDb.collection('votes').where('ipHash', '==', ipHash).get(), 4000, null);
+          if (ipSnap && ipSnap.size >= 10) {
+            res.status(400).json({ error: "Aynı internet ağından maksimum oy limitine ulaşıldı." });
+            return;
+          }
+        }
+
+        const voteRef = adminDb.collection('votes').doc(voteKey);
         await withTimeout(voteRef.set({
           deviceId,
+          fingerprint: fingerprint || 'unknown',
+          ipHash,
           mayorId,
           rating,
           createdAt: FieldValue.serverTimestamp()
@@ -341,13 +394,32 @@ app.post("/api/vote", async (req, res) => {
   }
 
   // In-memory fallback
-  if (memoryVotes.has(voteKey)) {
-    res.status(400).json({ error: "Bu belediye başkanı için zaten oy kullandınız." });
+  const deviceVoted = Array.from(memoryVotes.values()).some(v => v.deviceId === deviceId);
+  if (deviceVoted) {
+    res.status(400).json({ error: "Zaten bir oy kullandınız. Sadece tek bir belediye başkanı için oy kullanabilirsiniz." });
     return;
+  }
+
+  if (fingerprint) {
+    const fingerprintCount = Array.from(memoryVotes.values()).filter(v => v.fingerprint === fingerprint).length;
+    if (fingerprintCount >= 2) {
+      res.status(400).json({ error: "Cihaz limitine ulaşıldı. Bu tarayıcıdan en fazla 2 oy kullanılabilir." });
+      return;
+    }
+  }
+
+  if (ipHash !== 'unknown') {
+    const ipCount = Array.from(memoryVotes.values()).filter(v => v.ipHash === ipHash).length;
+    if (ipCount >= 10) {
+      res.status(400).json({ error: "Aynı internet ağından maksimum oy limitine ulaşıldı." });
+      return;
+    }
   }
 
   memoryVotes.set(voteKey, {
     deviceId,
+    fingerprint: fingerprint || 'unknown',
+    ipHash,
     mayorId,
     rating,
     createdAt: new Date().toISOString()
