@@ -222,13 +222,13 @@ function withTimeout<T>(promise: Promise<T>, ms: number, fallbackValue: T): Prom
 // API Routes
 app.get("/api/config", (req, res) => {
   res.json({
-    secureVotingEnabled: process.env.SECURE_VOTING_ENABLED === "true"
+    secureVotingEnabled: process.env.SECURE_VOTING_ENABLED !== "false"
   });
 });
 
 app.get("/api/mayors", async (req, res) => {
   try {
-    const isSecure = process.env.SECURE_VOTING_ENABLED === "true";
+    const isSecure = process.env.SECURE_VOTING_ENABLED !== "false";
     const collectionName = isSecure ? "ballots" : "votes";
     let allVotes: any[] = [];
     
@@ -430,7 +430,7 @@ app.post("/api/vote", async (req, res) => {
   const ipHash = rawIp ? crypto.createHash('sha256').update(rawIp).digest('hex') : 'unknown';
   const userAgent = req.headers['user-agent'] || 'unknown';
 
-  const isSecure = process.env.SECURE_VOTING_ENABLED === "true";
+  const isSecure = process.env.SECURE_VOTING_ENABLED !== "false";
   const voteKey = idempotencyKey || `${deviceId}-${mayorId}`;
 
   // If Secure Voting is Enabled: Transactional Credential Single-Cast
