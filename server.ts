@@ -21,6 +21,9 @@ try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
     // Vercel deployment approach
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+    if (serviceAccount.private_key) {
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+    }
     const existingApps = getAdminApps();
     const firebaseApp = existingApps.length > 0 
       ? existingApps[0] 
@@ -200,6 +203,21 @@ const MAYORS: Mayor[] = [
 // In-memory store fallback for AI Studio
 const memoryVotes = new Map<string, any>();
 
+// Timeout helper to prevent Vercel Serverless Function hangs
+function withTimeout<T>(promise: Promise<T>, ms: number, fallbackValue: T): Promise<T> {
+  let timeoutId: NodeJS.Timeout;
+  const timeoutPromise = new Promise<T>((resolve) => {
+    timeoutId = setTimeout(() => {
+      console.warn(`Promise timed out after ${ms}ms. Returning fallback.`);
+      resolve(fallbackValue);
+    }, ms);
+  });
+  return Promise.race([promise, timeoutPromise]).then((res) => {
+    clearTimeout(timeoutId);
+    return res;
+  });
+}
+
 // API Routes
 app.get("/api/mayors", async (req, res) => {
   try {
@@ -208,11 +226,11 @@ app.get("/api/mayors", async (req, res) => {
     if (adminDb || clientDb) {
       try {
         if (isUsingClient) {
-          const snapshot = await getDocs(collection(clientDb, 'votes'));
-          allVotes = snapshot.docs.map(d => d.data());
+          const snapshot = await withTimeout(getDocs(collection(clientDb, 'votes')), 4000, null);
+          allVotes = snapshot ? snapshot.docs.map(d => d.data()) : Array.from(memoryVotes.values());
         } else {
-          const snapshot = await adminDb.collection('votes').get();
-          allVotes = snapshot.docs.map((d: any) => d.data());
+          const snapshot = await withTimeout(adminDb.collection('votes').get(), 4000, null);
+          allVotes = snapshot ? snapshot.docs.map((d: any) => d.data()) : Array.from(memoryVotes.values());
         }
       } catch (err) {
         console.warn("Firestore query failed, using in-memory store", err);
@@ -285,34 +303,34 @@ app.post("/api/vote", async (req, res) => {
     try {
       if (isUsingClient) {
         const voteRef = doc(clientDb, 'votes', voteKey);
-        const docSnap = await getDoc(voteRef);
+        const docSnap = await withTimeout(getDoc(voteRef), 4000, null);
         
-        if (docSnap.exists()) {
+        if (docSnap && docSnap.exists()) {
           res.status(400).json({ error: "Bu belediye başkanı için zaten oy kullandınız." });
           return;
         }
 
-        await setDoc(voteRef, {
+        await withTimeout(setDoc(voteRef, {
           deviceId,
           mayorId,
           rating,
           createdAt: new Date().toISOString()
-        });
+        }), 4000, null);
       } else {
         const voteRef = adminDb.collection('votes').doc(voteKey);
-        const docSnap = await voteRef.get();
+        const docSnap = await withTimeout(voteRef.get(), 4000, null);
         
-        if (docSnap.exists) {
+        if (docSnap && docSnap.exists) {
           res.status(400).json({ error: "Bu belediye başkanı için zaten oy kullandınız." });
           return;
         }
 
-        await voteRef.set({
+        await withTimeout(voteRef.set({
           deviceId,
           mayorId,
           rating,
           createdAt: FieldValue.serverTimestamp()
-        });
+        }), 4000, null);
       }
       
       res.json({ success: true });
