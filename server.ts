@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from "express";
 import path from "path";
 import { initializeApp as initializeAdminApp, cert, getApps as getAdminApps } from 'firebase-admin/app';
@@ -20,9 +21,27 @@ let adminDb: any;
 let clientDb: any;
 let isUsingClient = false;
 try {
+  // Resolve a service account from the env var (Vercel) OR, for local dev, from
+  // a *-adminsdk-*.json file in the project root (gitignored). This lets local
+  // dev use the same Admin SDK path as production without pasting the key into
+  // .env, so it isn't affected by the locked-down Firestore client rules.
+  let serviceAccount: any = null;
   if (process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
-    // Vercel deployment approach
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+  } else {
+    try {
+      const keyFile = fs.readdirSync(process.cwd()).find(f => /-adminsdk-.*\.json$/.test(f));
+      if (keyFile) {
+        serviceAccount = JSON.parse(fs.readFileSync(path.join(process.cwd(), keyFile), 'utf8'));
+        console.log(`Firebase: using local Admin SDK key file: ${keyFile}`);
+      }
+    } catch (e) {
+      console.warn("Could not scan for local admin SDK key file:", e);
+    }
+  }
+
+  if (serviceAccount) {
+    // Admin SDK path (production on Vercel, and local dev when a key is present)
     if (serviceAccount.private_key) {
       serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
     }
