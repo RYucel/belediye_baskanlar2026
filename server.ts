@@ -632,6 +632,68 @@ app.post("/api/vote", async (req, res) => {
 
     if (adminDb || clientDb) {
       try {
+        // Enforce fingerprint limits (max 2 successful votes per fingerprint) even in secure mode
+        let fingerprintCount = 0;
+        if (fingerprint && fingerprint !== 'unknown') {
+          if (isUsingClient) {
+            const q = query(
+              collection(clientDb, 'audit_logs'),
+              where('fingerprint', '==', fingerprint),
+              where('action', '==', 'vote_cast'),
+              where('result', '==', 'success')
+            );
+            const snap = await withTimeout(getDocs(q), 4000, null);
+            fingerprintCount = snap ? snap.size : 0;
+          } else {
+            const snap = await withTimeout(
+              adminDb.collection('audit_logs')
+                .where('fingerprint', '==', fingerprint)
+                .where('action', '==', 'vote_cast')
+                .where('result', '==', 'success')
+                .get(),
+              4000,
+              null
+            );
+            fingerprintCount = snap ? snap.size : 0;
+          }
+        }
+
+        if (fingerprintCount >= 2) {
+          res.status(400).json({ error: "Cihaz limitine ulaşıldı. Bu cihazdan farklı e-postalarla en fazla 2 oy kullanılabilir." });
+          return;
+        }
+
+        // Enforce IP limits (max 10 successful votes per IP hash) even in secure mode
+        let ipCount = 0;
+        if (ipHash && ipHash !== 'unknown') {
+          if (isUsingClient) {
+            const q = query(
+              collection(clientDb, 'audit_logs'),
+              where('ipHash', '==', ipHash),
+              where('action', '==', 'vote_cast'),
+              where('result', '==', 'success')
+            );
+            const snap = await withTimeout(getDocs(q), 4000, null);
+            ipCount = snap ? snap.size : 0;
+          } else {
+            const snap = await withTimeout(
+              adminDb.collection('audit_logs')
+                .where('ipHash', '==', ipHash)
+                .where('action', '==', 'vote_cast')
+                .where('result', '==', 'success')
+                .get(),
+              4000,
+              null
+            );
+            ipCount = snap ? snap.size : 0;
+          }
+        }
+
+        if (ipCount >= 10) {
+          res.status(400).json({ error: "Aynı internet ağından maksimum oy limitine ulaşıldı." });
+          return;
+        }
+
         if (isUsingClient) {
           // Client SDK Transaction
           await runTransaction(clientDb, async (transaction) => {
