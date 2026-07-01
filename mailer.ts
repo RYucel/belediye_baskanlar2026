@@ -1,4 +1,4 @@
-// Pluggable one-time-password sender.
+// Pluggable one-time-password sender (configured via SMTP, Resend, or log-only).
 //
 // The voting flow only needs `sendOtp(email, code)`. Delivery is abstracted so
 // the provider can be swapped (Resend today, SMTP/SMS later) without touching
