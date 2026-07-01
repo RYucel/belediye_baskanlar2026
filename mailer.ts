@@ -6,6 +6,8 @@
 // startup; if none is configured we fall back to a log-only sender so local
 // development still works.
 
+import nodemailer from 'nodemailer';
+
 export interface OtpSender {
   readonly name: string;
   send(toEmail: string, code: string): Promise<void>;
@@ -29,6 +31,34 @@ class LogOnlySender implements OtpSender {
   readonly name = "log-only";
   async send(toEmail: string, code: string): Promise<void> {
     console.log(`[OTP LOG-ONLY] No mail provider configured. Code for ${toEmail}: ${code}`);
+  }
+}
+
+class SmtpSender implements OtpSender {
+  readonly name = "smtp";
+  private transporter: nodemailer.Transporter;
+  private from: string;
+
+  constructor(host: string, port: number, user: string, pass: string, from: string) {
+    this.transporter = nodemailer.createTransport({
+      host,
+      port,
+      secure: port === 465,
+      auth: {
+        user,
+        pass,
+      },
+    });
+    this.from = from;
+  }
+
+  async send(toEmail: string, code: string): Promise<void> {
+    await this.transporter.sendMail({
+      from: this.from,
+      to: toEmail,
+      subject: "KKTC Belediye Anketi - Doğrulama Kodu",
+      html: otpEmailHtml(code),
+    });
   }
 }
 
@@ -71,10 +101,17 @@ let cachedSender: OtpSender | null = null;
 export function getOtpSender(): OtpSender {
   if (cachedSender) return cachedSender;
 
-  const resendKey = process.env.RESEND_API_KEY;
+  const smtpHost = process.env.SMTP_HOST;
+  const smtpPort = process.env.SMTP_PORT ? parseInt(process.env.SMTP_PORT, 10) : 587;
+  const smtpUser = process.env.SMTP_USER;
+  const smtpPass = process.env.SMTP_PASS;
   const from = process.env.OTP_FROM_EMAIL || "onboarding@resend.dev";
 
-  if (resendKey) {
+  const resendKey = process.env.RESEND_API_KEY;
+
+  if (smtpHost && smtpUser && smtpPass) {
+    cachedSender = new SmtpSender(smtpHost, smtpPort, smtpUser, smtpPass, from);
+  } else if (resendKey) {
     cachedSender = new ResendSender(resendKey, from);
   } else {
     cachedSender = new LogOnlySender();
